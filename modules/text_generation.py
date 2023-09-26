@@ -42,7 +42,7 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
             yield ''
             return
 
-        if shared.model.__class__.__name__ in ['LlamaCppModel', 'RWKVModel', 'ExllamaModel', 'CtransformersModel']:
+        if shared.model.__class__.__name__ in ['LlamaCppModel', 'RWKVModel', 'ExllamaModel', 'Exllamav2Model', 'CtransformersModel']:
             generate_func = generate_reply_custom
         else:
             generate_func = generate_reply_HF
@@ -96,7 +96,7 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
                     last_update = cur_time
                     yield reply
 
-        if stop_found:
+        if stop_found or (state['max_tokens_second'] > 0 and shared.stop_everything):
             break
 
     if not is_chat:
@@ -106,9 +106,13 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
 
 
 def encode(prompt, add_special_tokens=True, add_bos_token=True, truncation_length=None):
-    if shared.model.__class__.__name__ in ['LlamaCppModel', 'RWKVModel', 'CtransformersModel']:
+    if shared.tokenizer is None:
+        raise ValueError('No tokenizer is loaded')
+
+    if shared.model.__class__.__name__ in ['LlamaCppModel', 'RWKVModel', 'CtransformersModel', 'Exllamav2Model']:
         input_ids = shared.tokenizer.encode(str(prompt))
-        input_ids = np.array(input_ids).reshape(1, len(input_ids))
+        if shared.model.__class__.__name__ not in ['Exllamav2Model']:
+            input_ids = np.array(input_ids).reshape(1, len(input_ids))
     else:
         input_ids = shared.tokenizer.encode(str(prompt), return_tensors='pt', add_special_tokens=add_special_tokens)
 
@@ -120,7 +124,7 @@ def encode(prompt, add_special_tokens=True, add_bos_token=True, truncation_lengt
     if truncation_length is not None:
         input_ids = input_ids[:, -truncation_length:]
 
-    if shared.model.__class__.__name__ in ['LlamaCppModel', 'RWKVModel', 'ExllamaModel', 'CtransformersModel'] or shared.args.cpu:
+    if shared.model.__class__.__name__ in ['LlamaCppModel', 'RWKVModel', 'ExllamaModel', 'Exllamav2Model', 'CtransformersModel'] or shared.args.cpu:
         return input_ids
     elif shared.args.deepspeed:
         return input_ids.to(device=local_rank)
@@ -132,6 +136,9 @@ def encode(prompt, add_special_tokens=True, add_bos_token=True, truncation_lengt
 
 
 def decode(output_ids, skip_special_tokens=True):
+    if shared.tokenizer is None:
+        raise ValueError('No tokenizer is loaded')
+
     return shared.tokenizer.decode(output_ids, skip_special_tokens)
 
 
@@ -141,6 +148,17 @@ def get_encoded_length(prompt):
         return length_after_extensions
 
     return len(encode(prompt)[0])
+
+
+def get_token_ids(prompt):
+    tokens = encode(prompt)[0]
+    decoded_tokens = [shared.tokenizer.decode([i]) for i in tokens]
+
+    output = ''
+    for row in list(zip(tokens, decoded_tokens)):
+        output += f"{str(int(row[0])).ljust(5)}  -  {repr(row[1])}\n"
+
+    return output
 
 
 def get_max_prompt_length(state):
@@ -265,6 +283,14 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
     if state['ban_eos_token']:
         generate_params['suppress_tokens'] = [shared.tokenizer.eos_token_id]
 
+    if state['custom_token_bans']:
+        to_ban = [int(x) for x in state['custom_token_bans'].split(',')]
+        if len(to_ban) > 0:
+            if generate_params.get('suppress_tokens', None):
+                generate_params['suppress_tokens'] += to_ban
+            else:
+                generate_params['suppress_tokens'] = to_ban
+
     generate_params.update({'use_cache': not shared.args.no_cache})
     if shared.args.deepspeed:
         generate_params.update({'synced_gpus': True})
@@ -290,8 +316,8 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
     generate_params['stopping_criteria'].append(_StopEverythingStoppingCriteria())
 
     processor = state.get('logits_processor', LogitsProcessorList([]))
-    # In case folks just pass in a processor by itself.
-    if type(processor) != LogitsProcessorList:
+    # In case a processor is passed by itself.
+    if not isinstance(processor, LogitsProcessorList):
         processor = LogitsProcessorList([processor])
     apply_extensions('logits_processor', processor, input_ids)
     generate_params['logits_processor'] = processor

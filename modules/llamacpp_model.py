@@ -1,47 +1,30 @@
 import re
 from functools import partial
-from pathlib import Path
-from typing import Union
 
+import numpy as np
 import torch
 
 from modules import RoPE, shared
 from modules.callbacks import Iteratorize
 from modules.logging_colors import logger
 from modules.text_generation import get_max_prompt_length
-from modules.utils import is_gguf
-
-import llama_cpp
 
 try:
-    import llama_cpp_ggml
+    import llama_cpp
 except:
-    llama_cpp_ggml = llama_cpp
+    llama_cpp = None
 
-if torch.cuda.is_available() and not torch.version.hip:
-    try:
-        import llama_cpp_cuda
-    except:
-        llama_cpp_cuda = None
-    try:
-        import llama_cpp_ggml_cuda
-    except:
-        llama_cpp_ggml_cuda = llama_cpp_cuda
-else:
+try:
+    import llama_cpp_cuda
+except:
     llama_cpp_cuda = None
-    llama_cpp_ggml_cuda = None
 
 
-def llama_cpp_lib(model_file: Union[str, Path] = None):
-    if model_file is not None:
-        gguf_model = is_gguf(model_file)
+def llama_cpp_lib():
+    if (shared.args.cpu and llama_cpp is not None) or llama_cpp_cuda is None:
+        return llama_cpp
     else:
-        gguf_model = True
-
-    if shared.args.cpu or llama_cpp_cuda is None:
-        return llama_cpp if gguf_model else llama_cpp_ggml
-    else:
-        return llama_cpp_cuda if gguf_model else llama_cpp_ggml_cuda
+        return llama_cpp_cuda
 
 
 def ban_eos_logits_processor(eos_token, input_ids, logits):
@@ -49,9 +32,18 @@ def ban_eos_logits_processor(eos_token, input_ids, logits):
     return logits
 
 
+def custom_token_ban_logits_processor(token_ids, input_ids, logits):
+    for token_id in token_ids:
+        logits[token_id] = -float('inf')
+
+    return logits
+
+
 class LlamaCppModel:
     def __init__(self):
         self.initialized = False
+        self.grammar_string = ''
+        self.grammar = None
 
     def __del__(self):
         self.model.__del__()
@@ -59,8 +51,8 @@ class LlamaCppModel:
     @classmethod
     def from_pretrained(self, path):
 
-        Llama = llama_cpp_lib(path).Llama
-        LlamaCache = llama_cpp_lib(path).LlamaCache
+        Llama = llama_cpp_lib().Llama
+        LlamaCache = llama_cpp_lib().LlamaCache
 
         result = self()
         cache_capacity = 0
@@ -95,13 +87,6 @@ class LlamaCppModel:
             'rope_freq_scale': 1.0 / shared.args.compress_pos_emb,
         }
 
-        if not is_gguf(path):
-            ggml_params = {
-                'n_gqa': shared.args.n_gqa or None,
-                'rms_norm_eps': shared.args.rms_norm_eps or None,
-            }
-            params = params | ggml_params
-
         result.model = Llama(**params)
         if cache_capacity > 0:
             result.model.set_cache(LlamaCache(capacity_bytes=cache_capacity))
@@ -115,8 +100,22 @@ class LlamaCppModel:
 
         return self.model.tokenize(string)
 
-    def decode(self, tokens):
-        return self.model.detokenize(tokens)
+    def decode(self, ids):
+        return self.model.detokenize(ids).decode('utf-8')
+
+    def get_logits(self, tokens):
+        self.model.eval(tokens)
+        logits = self.model._scores
+        logits = np.expand_dims(logits, 0)  # batch dim is expected
+        return torch.tensor(logits, dtype=torch.float32)
+
+    def load_grammar(self, string):
+        if string != self.grammar_string:
+            self.grammar_string = string
+            if string.strip() != '':
+                self.grammar = llama_cpp_lib().LlamaGrammar.from_string(string)
+            else:
+                self.grammar = None
 
     def generate(self, prompt, state, callback=None):
 
@@ -127,7 +126,17 @@ class LlamaCppModel:
         # Handle truncation
         prompt = self.encode(prompt)
         prompt = prompt[-get_max_prompt_length(state):]
-        prompt = self.decode(prompt).decode('utf-8')
+        prompt = self.decode(prompt)
+
+        self.load_grammar(state['grammar_string'])
+        logit_processors = LogitsProcessorList()
+        if state['ban_eos_token']:
+            logit_processors.append(partial(ban_eos_logits_processor, self.model.token_eos()))
+
+        if state['custom_token_bans']:
+            to_ban = [int(x) for x in state['custom_token_bans'].split(',')]
+            if len(to_ban) > 0:
+                logit_processors.append(partial(custom_token_ban_logits_processor, to_ban))
 
         completion_chunks = self.model.create_completion(
             prompt=prompt,
@@ -141,9 +150,8 @@ class LlamaCppModel:
             mirostat_tau=state['mirostat_tau'],
             mirostat_eta=state['mirostat_eta'],
             stream=True,
-            logits_processor=LogitsProcessorList([
-                partial(ban_eos_logits_processor, self.model.token_eos()),
-            ]) if state['ban_eos_token'] else None,
+            logits_processor=logit_processors,
+            grammar=self.grammar
         )
 
         output = ""
